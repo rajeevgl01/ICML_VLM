@@ -1,0 +1,19 @@
+# sweep.yaml
+program: run.py
+project: ICML_VLM
+method: r  # Can also be grid or random
+metric:
+  name: test_auc
+  goal: maximize
+parameters:
+  lr:
+    values: [2.5e-2, 1e-2, 5e-3, 2.5e-3, 1e-3]
+  weight_decay:
+    values: [0, 5e-2, 5e-3, 5e-4]
+  num_epochs:
+    values: [10, 20, 50, 75, 100, 200]
+  warmup_epochs:
+    values: [0, 5]
+  min_lr:
+    values: [1e-4, 1e-5, 1e-6]
+
