@@ -48,12 +48,13 @@ class MedicalReportDataset(Dataset):
 
 # Custom dataset class
 class CheXpertVLMDataset(Dataset):
-	def __init__(self, json_file, embedding_file, image_root, image_centers, image_anti_centers, embedding_centers, embedding_anti_centers, transform, mode='train'):
+	def __init__(self, json_file, embedding_file, logits_file, image_root, image_centers, image_anti_centers, embedding_centers, embedding_anti_centers, transform, mode='train'):
 		self.image_root = image_root
 		self.mode = mode
 		self.transform = transform
 		if mode == 'train':
 			self.embedding_dict = self.get_embedding_dict(embedding_file)
+			self.logits_dict = self.get_text_logits(logits_file)
 		
 			self.image_centers, self.image_anti_centers, self.embedding_centers, self.embedding_anti_centers = image_centers, image_anti_centers, embedding_centers, embedding_anti_centers
 
@@ -69,6 +70,10 @@ class CheXpertVLMDataset(Dataset):
 	def get_embedding_dict(self, embedding_file):
 		embedding_dict = torch.load(embedding_file, map_location='cpu')
 		return embedding_dict
+	
+	def get_text_logits(self, logits_file):
+		logits_dict = torch.load(logits_file, map_location='cpu')
+		return logits_dict
 	
 	def __len__(self):
 		# Return the total number of samples
@@ -123,8 +128,9 @@ class CheXpertVLMDataset(Dataset):
 
 		if self.mode == 'train':
 			embedding = self.embedding_dict[item["Path"]]['embedding']
+			text_logits = self.logits_dict[item["Path"]]
 			image_score, embedding_score = self.compute_input_score(image, embedding)
-			return image, embedding, labels, image_score, embedding_score
+			return image, embedding, labels, image_score, embedding_score, text_logits, idx
 		
 		return image, labels
 
@@ -158,7 +164,8 @@ def build_dataset_chest_xray(split, image_centers, image_anti_centers, embedding
 	transform = build_transform(is_train, args)
 	file = args.train_file if is_train else args.test_file
 	embedding_file = args.train_embedding_file
+	logits_file = args.train_logits_file
 	mode = 'train' if is_train else 'test'
-	dataset = CheXpertVLMDataset(json_file=file, embedding_file=embedding_file, image_root=args.data_path, image_centers=image_centers, 
+	dataset = CheXpertVLMDataset(json_file=file, embedding_file=embedding_file, logits_file=logits_file, image_root=args.data_path, image_centers=image_centers, 
 							  image_anti_centers=image_anti_centers, embedding_centers=embedding_centers, embedding_anti_centers=embedding_anti_centers, transform=transform, mode=mode)
 	return dataset

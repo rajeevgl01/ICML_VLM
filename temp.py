@@ -1,135 +1,106 @@
-@torch.no_grad()
-def get_image_centers(dataloader, device, rank, args):
-    if rank == 0:
-        progress_bar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Cluster Centroids", position=0)
-    else:
-        progress_bar = enumerate(dataloader)
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.distributed as dist
+import timm.optim.optim_factory as optim_factory
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, TensorDataset, DistributedSampler
+import os
+import wandb
+from datetime import datetime
+import argparse
+from utils import *
+from engine_pretrain_text import *
+from torch.utils.data import Dataset
+from adapter import AdapterClassifier
 
-    # Function to update local centroids and anti-centroids
-    def update_local_centroids_and_anti_centroids(centroids, anti_centroids, data, labels, num_classes):
-        for d, lbl in zip(data, labels):
-            for cls in range(num_classes):
-                if lbl[cls] == 1.:
-                    centroids[cls]['sum'] += d
-                    centroids[cls]['count'] += 1
-                elif lbl[cls] == 0.:
-                    anti_centroids[cls]['sum'] += d
-                    anti_centroids[cls]['count'] += 1
+class MedicalDataset(Dataset):
+	def __init__(self, pt_file):
+		self.data = torch.load(pt_file, map_location='cpu')
 
-        return centroids, anti_centroids
+		self.file_paths = []
 
-    # Function to aggregate centroids across all GPUs using all-reduce
-    def all_reduce_centroids_and_anti_centroids(centroids, anti_centroids, num_classes):
-        for cls in range(num_classes):
-            # Aggregate the sum and count across all GPUs for centroids
-            dist.all_reduce(centroids[cls]['sum'], op=dist.ReduceOp.SUM)
-            dist.all_reduce(centroids[cls]['count'], op=dist.ReduceOp.SUM)
+		for key, val in self.data.items():
+			self.file_paths.append(key)
+	
+	def __len__(self):
+		return len(self.file_paths)
+		
+	def __getitem__(self, idx):
+		item = self.data[self.file_paths[idx]]
+		return self.file_paths[idx], item['embedding']
 
-            # Aggregate the sum and count across all GPUs for anti-centroids
-            dist.all_reduce(anti_centroids[cls]['sum'], op=dist.ReduceOp.SUM)
-            dist.all_reduce(anti_centroids[cls]['count'], op=dist.ReduceOp.SUM)
+def train_one_epoch(text_model, dataloader, device, rank, epoch, num_epochs):
+	text_model.eval()
 
-        return centroids, anti_centroids
+	if rank == 0:
+		progress_bar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch+1}/{num_epochs}", position=0)
+	else:
+		progress_bar = enumerate(dataloader)
+	
+	logit_dict = {}
 
-    # Function to compute the final centroids and anti-centroids after global aggregation
-    def compute_final_centroids_and_anti_centroids(centroids, anti_centroids, num_classes, data_size):
-        centroids_list = []
-        anti_centroids_list = []
+	# Inference loop
+	for _, (file_path, embedding) in progress_bar:
+		embedding = embedding.to(device, non_blocking=True)
 
-        for cls in range(num_classes):
-            if centroids[cls]['count'].item() > 0:
-                centroid = centroids[cls]['sum'] / centroids[cls]['count']
-            else:
-                centroid = torch.zeros((data_size), device=centroids[cls]['sum'].device)
-            centroids_list.append(centroid)
+		# Mixed precision training with gradient scaler
+		with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+			text_logits, _ = text_model(embedding)
+			logit_dict[file_path[0]] = nn.functional.sigmoid(text_logits)[0].detach().cpu()
+			print(nn.functional.sigmoid(text_logits)[0])
+	
+	torch.save(logit_dict, "/home/local/ASURITE/rgoel15/ICML_VLM/passage_logits.pt")
 
-            if anti_centroids[cls]['count'].item() > 0:
-                anti_centroid = anti_centroids[cls]['sum'] / anti_centroids[cls]['count']
-            else:
-                anti_centroid = torch.zeros((data_size), device=anti_centroids[cls]['sum'].device)
-            anti_centroids_list.append(anti_centroid)
+# Training function
+def main(rank, world_size, args):
+	# Setup DDP
+	setup_ddp(rank, world_size)
+	
+	# Set device for the current process
+	device = torch.device(f'cuda:{rank}')
 
-        # Stack the list into tensors
-        centroids_tensor = torch.stack(centroids_list)
-        anti_centroids_tensor = torch.stack(anti_centroids_list)
+	# Create dataloaders
+	train_dataset = MedicalDataset(args.train_file)
+	train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+	train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler, num_workers=4, pin_memory=True, drop_last=False)
+	
+	# Initialize model, optimizer, loss function, and NativeScaler for mixed precision
+	model = AdapterClassifier(args.input_dim, args.output_dim, args.num_classes).to(device)
+	print(str(model))
+	n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+	print('number of params (M): %.2f' % (n_parameters / 1.e6))
+	model_without_ddp = model
+	model = DDP(model, device_ids=[rank])
 
-        return centroids_tensor, anti_centroids_tensor
+	checkpoint = torch.load(args.resume)
+	model_without_ddp.load_state_dict(checkpoint['model_state_dict'], strict=True)
+	
+	train_dataloader.sampler.set_epoch(0)
+	train_one_epoch(model, train_dataloader, device, rank, 0, args.num_epochs)
 
-    # Define the size of image data and embeddings
-    image_size = 224 * 224 * 3  # Assuming flattened images of size 224x224x3
-    embedding_size = 4096  # Embedding size as given
 
-    # Initialize centroids and anti-centroids for both image data and embeddings
-    centroids_images = {
-        cls: {
-            'sum': torch.zeros((image_size), device=device),
-            'count': torch.tensor(0.0, device=device)
-        }
-        for cls in range(args.nb_classes)
-    }
-    anti_centroids_images = {
-        cls: {
-            'sum': torch.zeros((image_size), device=device),
-            'count': torch.tensor(0.0, device=device)
-        }
-        for cls in range(args.nb_classes)
-    }
+	cleanup_ddp()
 
-    centroids_embeddings = {
-        cls: {
-            'sum': torch.zeros((embedding_size), device=device),
-            'count': torch.tensor(0.0, device=device)
-        }
-        for cls in range(args.nb_classes)
-    }
-    anti_centroids_embeddings = {
-        cls: {
-            'sum': torch.zeros((embedding_size), device=device),
-            'count': torch.tensor(0.0, device=device)
-        }
-        for cls in range(args.nb_classes)
-    }
+if __name__ == "__main__":
+	parser = argparse.ArgumentParser(description="Multi-GPU Training with Checkpointing and wandb Logging")
+	parser.add_argument('--train_file', type=str, required=True, help="Path to the train .pt file containing embeddings and labels")
+	parser.add_argument('--resume', default=None, help="Resume training from latest checkpoint if available")
+	parser.add_argument('--eval', default=None, help="Checkpoint path to evaluate the model")
+	parser.add_argument('--num_epochs', type=int, default=100, help="Number of epochs to train the model")
+	parser.add_argument('--warmup_epochs', type=int, default=5, help="Number of warmup epochs to train the model")
+	parser.add_argument('--batch_size', type=int, default=1, help="Batch size for training")
+	parser.add_argument('--lr', type=float, default=1e-3, help="Initial learning rate for training")
+	parser.add_argument('--min_lr', type=float, default=1e-6, help="Minimum learning rate for the CosineAnnealingLR scheduler")
+	parser.add_argument('--weight_decay', type=float, default=1e-5, help="Weight decay for Adam optimizer")
+	parser.add_argument('--num_classes', type=int, default=5, help="number of classes in the dataset")
+	parser.add_argument('--input_dim', type=int, default=4096, help="Embedding dimensions of the text embedder model")
+	parser.add_argument('--output_dim', type=int, default=768, help="Feature dimension; must be same as the image feature extraction backbon. Eg: 768 for ViT-B/16")
 
-    # Process batches of images and embeddings
-    for batch_idx, (images, embeddings, target) in progress_bar:
-        images = images.to(device, non_blocking=True)
-        embeddings = embeddings.to(device, non_blocking=True)
-        target = target.to(device, non_blocking=True)
+	args = parser.parse_args()
 
-        # Flatten the images to the shape (batch_size, image_size)
-        images_flattened = images.view(images.size(0), -1)
+	# Run the main function for multi-GPU training
+	world_size = torch.cuda.device_count()  # Number of available GPUs
 
-        # Update centroids and anti-centroids for both image data and embeddings
-        centroids_images, anti_centroids_images = update_local_centroids_and_anti_centroids(
-            centroids_images, anti_centroids_images, images_flattened, target, args.nb_classes
-        )
-        centroids_embeddings, anti_centroids_embeddings = update_local_centroids_and_anti_centroids(
-            centroids_embeddings, anti_centroids_embeddings, embeddings, target, args.nb_classes
-        )
+	main(int(os.environ['RANK']), world_size, args)
 
-    # Aggregate centroids and anti-centroids across all GPUs for image data
-    centroids_images, anti_centroids_images = all_reduce_centroids_and_anti_centroids(
-        centroids_images, anti_centroids_images, args.nb_classes
-    )
-    # Aggregate centroids and anti-centroids across all GPUs for embeddings
-    centroids_embeddings, anti_centroids_embeddings = all_reduce_centroids_and_anti_centroids(
-        centroids_embeddings, anti_centroids_embeddings, args.nb_classes
-    )
-
-    # Compute final centroids and anti-centroids for image data
-    final_centroids_images, final_anti_centroids_images = compute_final_centroids_and_anti_centroids(
-        centroids_images, anti_centroids_images, args.nb_classes, image_size
-    )
-
-    # Compute final centroids and anti-centroids for embeddings
-    final_centroids_embeddings, final_anti_centroids_embeddings = compute_final_centroids_and_anti_centroids(
-        centroids_embeddings, anti_centroids_embeddings, args.nb_classes, embedding_size
-    )
-
-    # Normalize the centroids and anti-centroids
-    final_centroids_images = F.normalize(final_centroids_images, p=2, dim=1)
-    final_anti_centroids_images = F.normalize(final_anti_centroids_images, p=2, dim=1)
-    final_centroids_embeddings = F.normalize(final_centroids_embeddings, p=2, dim=1)
-    final_anti_centroids_embeddings = F.normalize(final_anti_centroids_embeddings, p=2, dim=1)
-
-    return final_centroids_images, final_anti_centroids_images, final_centroids_embeddings, final_anti_centroids_embeddings

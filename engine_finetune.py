@@ -6,6 +6,7 @@ import numpy as np
 from sklearn.metrics import roc_auc_score
 import torch.nn.functional as F
 import torch.distributed as dist
+import scipy
 
 def computeAUROC(dataGT, dataPRED, classCount):
 	outAUROC = []
@@ -52,13 +53,26 @@ def test(model, dataloader, criterion, device, rank, args):
 	avg_test_loss = sum(test_loss) / len(test_loss)
 	return avg_test_loss, auc_avg
 
-def train_one_epoch(image_model, text_model, dataloader, criterion, optimizer, scaler, device, rank, epoch, num_epochs, image_feature_centroids, image_feature_anti_centroids, text_feature_centroids, text_feature_anti_centroids, args):
+def trucated_nuclear_loss(F, U, V, softRank, id_F):
+	if U.shape[0] != F.shape[0]:
+		U_mini_batch = U[id_F]
+	S = U_mini_batch.T @ F
+	S = S @ V
+	S = torch.diag(S)
+	nuc_loss = torch.norm(S[softRank:], p=1)
+	return nuc_loss
+
+def train_one_epoch(image_model, text_model, dataloader, criterion, optimizer, scaler, device, rank, epoch, num_epochs, image_feature_centroids, image_feature_anti_centroids, text_feature_centroids, text_feature_anti_centroids, U, V, args):
+	assert U.numel() > 0
+	assert V.numel() > 0
+
 	image_model.train()
 	text_model.train()
 	epoch_loss = []
 	bc_loss = []
 	image_IB = []
 	text_IB = []
+	low_rank_loss = []
 	optimizer.zero_grad()
 
 	if rank == 0:
@@ -67,7 +81,7 @@ def train_one_epoch(image_model, text_model, dataloader, criterion, optimizer, s
 		progress_bar = enumerate(dataloader)
 
 	# Inference loop
-	for batch_idx, (input, embedding, targets, input_score, embedding_score) in progress_bar:
+	for batch_idx, (input, embedding, targets, input_score, embedding_score, indexes) in progress_bar:
 		adjust_learning_rate(optimizer, batch_idx / len(dataloader) + epoch, args)
 
 		# Transfer data to GPU
@@ -76,6 +90,7 @@ def train_one_epoch(image_model, text_model, dataloader, criterion, optimizer, s
 		targets = targets.to(device, non_blocking=True)
 		input_score = input_score.to(device, non_blocking=True)
 		embedding_score = embedding_score.to(device, non_blocking=True)
+		indexes = indexes.to(device, non_blocking=True)
 
 		# Mixed precision training with gradient scaler
 		with torch.cuda.amp.autocast(dtype=torch.bfloat16):
@@ -91,7 +106,8 @@ def train_one_epoch(image_model, text_model, dataloader, criterion, optimizer, s
 		image_ib_loss, text_ib_loss = get_IB(3, image_feature_centroids, image_feature_anti_centroids, text_feature_centroids, text_feature_anti_centroids, image_features, text_features, input_score, embedding_score, image_ib_loss, text_ib_loss, device)
 		image_ib_loss, text_ib_loss = get_IB(4, image_feature_centroids, image_feature_anti_centroids, text_feature_centroids, text_feature_anti_centroids, image_features, text_features, input_score, embedding_score, image_ib_loss, text_ib_loss, device)
 		
-		loss = ce_loss + args.image_ib_weight * image_ib_loss / 5 + args.text_ib_weight * text_ib_loss / 5
+		tn_loss = trucated_nuclear_loss(image_features, U, V, args.soft_rank, indexes.to(torch.int64))
+		loss = ce_loss + args.tn_loss_weight * tn_loss + args.image_ib_weight * image_ib_loss / 5 + args.text_ib_weight * text_ib_loss / 5
 
 		# Scale and backpropagate the final loss
 		scaler(loss, optimizer, clip_grad=None, parameters=concat_generators(image_model.parameters(), text_model.parameters()), create_graph=False, update_grad=True)
@@ -100,16 +116,16 @@ def train_one_epoch(image_model, text_model, dataloader, criterion, optimizer, s
 		bc_loss.append(ce_loss.item())
 		image_IB.append(image_ib_loss.item() / 5)
 		text_IB.append(text_ib_loss.item() / 5)
-
+		low_rank_loss.append(tn_loss.item())
 
 		optimizer.zero_grad()
 		torch.cuda.synchronize()
 
 		if rank == 0:
-			progress_bar.set_postfix(loss=loss.item(), ce_loss=ce_loss.item(), image_IB_loss=image_ib_loss.item() / 5, text_IB_loss=text_ib_loss.item() / 5)
+			progress_bar.set_postfix(loss=loss.item(), ce_loss=ce_loss.item(), image_IB_loss=image_ib_loss.item() / 5, text_IB_loss=text_ib_loss.item() / 5, tn_loss=tn_loss.item())
 
 	k = len(epoch_loss)
-	return sum(epoch_loss) / k, sum(bc_loss) / k, sum(image_IB) / k, sum(text_IB) / k
+	return sum(epoch_loss) / k, sum(bc_loss) / k, sum(image_IB) / k, sum(text_IB) / k, sum(low_rank_loss) / k
 
 @torch.no_grad()
 def compute_feature_centroids(image_model, text_model, dataloader, device, rank, args):
@@ -126,12 +142,14 @@ def compute_feature_centroids(image_model, text_model, dataloader, device, rank,
 	local_image_features = torch.empty((0, )).to(device)
 	local_text_features = torch.empty((0, )).to(device)
 	local_labels = torch.empty((0, )).to(device)
+	local_indexes = torch.empty((0, )).to(device)
 
-	for batch_idx, (input, embedding, targets, _, _) in progress_bar:
+	for batch_idx, (input, embedding, targets, _, _, indexes) in progress_bar:
 		# Transfer data to GPU
 		input = input.to(device, non_blocking=True)
 		embedding = embedding.to(device, non_blocking=True)
 		targets = targets.to(device, non_blocking=True)
+		indexes = indexes.to(device, non_blocking=True)
 
 		with torch.cuda.amp.autocast(dtype=torch.bfloat16):
 			# Forward pass for feature extraction
@@ -142,32 +160,36 @@ def compute_feature_centroids(image_model, text_model, dataloader, device, rank,
 		local_image_features = torch.cat((local_image_features, image_feature), dim=0)
 		local_text_features = torch.cat((local_text_features, text_feature), dim=0)
 		local_labels = torch.cat((local_labels, targets), dim=0)
+		local_indexes = torch.cat((local_indexes, indexes), dim=0)
 
 	# Prepare to gather features and scores from all GPUs (on CPU)
 	gather_image_features = [torch.zeros_like(local_image_features) for _ in range(dist.get_world_size())]
 	gather_text_features = [torch.zeros_like(local_text_features) for _ in range(dist.get_world_size())]
 	gather_labels = [torch.zeros_like(local_labels) for _ in range(dist.get_world_size())]
+	gather_indexes = [torch.zeros_like(local_indexes) for _ in range(dist.get_world_size())]
 
 	# Gather all the features, labels, and scores across all GPUs
 	dist.all_gather(gather_image_features, local_image_features)
 	dist.all_gather(gather_text_features, local_text_features)
 	dist.all_gather(gather_labels, local_labels)
+	dist.all_gather(gather_indexes, local_indexes)
 
 	# Concatenate the gathered results from all processes (on CPU)
 	image_features = torch.cat(gather_image_features, dim=0)
 	text_features = torch.cat(gather_text_features, dim=0)
 	labels = torch.cat(gather_labels, dim=0)
+	indexes = torch.cat(gather_indexes)
 
 	# Compute centroids and anti-centroids with data from all GPUs on CPU
 	image_feature_centroids, image_feature_anti_centroids = compute_centroids(image_features, labels, args.num_classes)
 	text_feature_centroids, text_feature_anti_centroids = compute_centroids(text_features, labels, args.num_classes)
 
 	# Free memory for feature tensors after computing centroids
-	del image_features, text_features, labels
+	del text_features, labels, gather_image_features, gather_text_features, gather_labels, gather_indexes
+	del local_image_features, local_indexes, local_labels, local_text_features
 	torch.cuda.empty_cache()
 
-	return image_feature_centroids, image_feature_anti_centroids, text_feature_centroids, text_feature_anti_centroids
-
+	return image_feature_centroids, image_feature_anti_centroids, text_feature_centroids, text_feature_anti_centroids, image_features, indexes
 
 def get_IB(cls, image_feature_centroids, image_feature_anti_centroids, text_feature_centroids, text_feature_anti_centroids, image_features, text_features, inputs_score, embeddings_score, image_ib_loss, text_ib_loss, device):
 	image_feature_cls_centroid = image_feature_centroids[cls].unsqueeze(0)
@@ -423,3 +445,18 @@ def compute_input_scores(dataloader, image_centers, image_anti_centers, embeddin
 		embeddings_scores = torch.cat((embeddings_scores, inter_score), dim=0)
 
 	return inputs_scores, embeddings_scores
+
+@torch.no_grad()
+def compute_svd(features, indexes, device):
+	n, dim = features.shape[0], features.shape[1]
+	U, V = torch.empty((n, dim)).cuda(), torch.empty((dim, dim)).cuda()
+
+	sorted_indexes = torch.argsort(indexes)
+	features = features[sorted_indexes].cpu().numpy()
+
+	U, _, V = scipy.linalg.svd(features, full_matrices=False)
+	U, V = torch.tensor(U).cuda().contiguous(), torch.tensor(V).cuda().contiguous()
+	del features, indexes
+	torch.cuda.empty_cache()
+	U, V = U.to(device), V.to(device)
+	return U, V

@@ -11,8 +11,9 @@ import wandb
 from datetime import datetime
 import argparse
 from utils import *
-from engine_finetune import *
-from adapter import AdapterFeatures
+from engine_final_mfa import *
+from adapter import AdapterFeatures, AdapterClassifier
+from models_subnet import *
 import models_vit
 from pos_embed import interpolate_pos_embed
 from timm.models.layers import trunc_normal_
@@ -66,7 +67,7 @@ def main(rank, world_size, args):
 	test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, sampler=test_sampler, num_workers=4, pin_memory=True, drop_last=False)
 	
 	# Initialize model, optimizer, loss function, and NativeScaler for mixed precision
-	text_backbone = AdapterFeatures(args.input_dim, args.output_dim).to(device)
+	text_backbone = AdapterClassifier(args.input_dim, args.output_dim, args.num_classes).to(device)
 	n_parameters = sum(p.numel() for p in text_backbone.parameters() if p.requires_grad)
 	print('number of params in text_backbone (M): %.2f' % (n_parameters / 1.e6))
 
@@ -78,6 +79,10 @@ def main(rank, world_size, args):
 			global_pool=args.global_pool,
 		)
 	
+	text_subnet = TextSubnet(args.output_dim, args.num_classes).to(device)
+	n_parameters = sum(p.numel() for p in text_subnet.parameters() if p.requires_grad)
+	print('number of params in text reweighting subnet (M): %.2f' % (n_parameters / 1.e6))
+
 	if args.finetune and not args.eval:
 		checkpoint = torch.load(args.finetune, map_location='cpu')
 
@@ -105,21 +110,24 @@ def main(rank, world_size, args):
 
 		print(f"Load pre-trained adapter checkpoint from: {args.finetune_adapter}" )
 		checkpoint_model = checkpoint['model_state_dict']
-		temp = checkpoint_model.copy()
-		for k in temp.keys():
-			if 'head' in k:
-				del checkpoint_model[k]
+		# temp = checkpoint_model.copy()
+		# for k in temp.keys():
+		# 	if 'head' in k:
+		# 		del checkpoint_model[k]
 		
 		msg = text_backbone.load_state_dict(checkpoint_model, strict=True)
 		print(msg)
 	
 	image_backbone.to(device)
 	text_backbone.to(device)
+	text_subnet.to(device)
 
 	image_backbone_without_ddp = image_backbone
 	text_backbone_without_ddp = text_backbone
+	text_subnet_without_ddp = text_subnet
 	image_backbone = DDP(image_backbone, device_ids=[rank])
 	text_backbone = DDP(text_backbone, device_ids=[rank])
+	text_subnet = DDP(text_subnet, device_ids=[rank])
 	criterion = nn.BCEWithLogitsLoss()
 	
 	eff_batch_size = args.batch_size * world_size
@@ -127,6 +135,7 @@ def main(rank, world_size, args):
 	args.text_lr = args.text_lr * eff_batch_size / 256
 
 	text_backbone_param_groups = optim_factory.param_groups_weight_decay(text_backbone_without_ddp, args.text_backbone_weight_decay)
+	text_subnet_param_groups = optim_factory.param_groups_weight_decay(text_subnet_without_ddp, args.text_backbone_weight_decay)
 	image_backbone_param_groups = lrd.param_groups_lrd(image_backbone_without_ddp, args.weight_decay,
 			no_weight_decay_list=image_backbone_without_ddp.no_weight_decay(),
 			layer_decay=args.layer_decay
@@ -134,12 +143,16 @@ def main(rank, world_size, args):
 
 	for param_group in text_backbone_param_groups:
 		param_group['lr'] = args.text_lr
+	
+	for param_group in text_subnet_param_groups:
+		param_group['lr'] = args.text_subnet_lr
 
 	for param_group in image_backbone_param_groups:
 		param_group['lr'] = args.lr
 
 	# Combine the parameter groups and pass them to the optimizer
 	optimizer = optim.AdamW(image_backbone_param_groups + text_backbone_param_groups)
+	subnet_optimizer = optim.AdamW(text_subnet_param_groups)
 	scaler = NativeScalerWithGradNormCount()  
 
 	best_loss = float('inf')
@@ -148,20 +161,28 @@ def main(rank, world_size, args):
 
 	start_epoch = 0
 	if args.resume:
-		checkpoint_path = os.path.join(args.checkpoint_dir, "latest.pt")
+		checkpoint_path = args.resume
 		if os.path.exists(checkpoint_path):
-			start_epoch, best_loss, best_auc = load_checkpoint(checkpoint_path, image_backbone, text_backbone, optimizer, scaler)
+			start_epoch, best_loss, best_auc = load_checkpoint(checkpoint_path, image_backbone_without_ddp, text_backbone_without_ddp, text_subnet_without_ddp, subnet_optimizer, optimizer, scaler)
 			print(f"Resumed from checkpoint at epoch {start_epoch}")
 
+	if args.retrain:
+		checkpoint_path = args.retrain
+		if os.path.exists(checkpoint_path):
+			checkpoint = torch.load(checkpoint_path, map_location='cpu')
+			print(checkpoint.keys())
+			image_backbone_without_ddp.load_state_dict(checkpoint['imaget_model_state_dict'])
+			text_backbone_without_ddp.load_state_dict(checkpoint['text_model_state_dict'], strict=False)
+	
 	# Training loop
 	for epoch in range(start_epoch, args.num_epochs):
 		if early_stopping == 20:
 			exit()
 
 		train_dataloader.sampler.set_epoch(epoch)
-		image_feature_centroids, image_feature_anti_centroids, text_feature_centroids, text_feature_anti_centroids, image_features, indexes = compute_feature_centroids(image_backbone, text_backbone, train_dataloader, device, rank, args)
+		image_feature_centroids, image_feature_anti_centroids, text_feature_centroids, text_feature_anti_centroids, image_features, indexes = compute_feature_centroids(image_backbone, text_backbone, text_subnet, subnet_optimizer, scaler, train_dataloader, device, rank, epoch, args)
 		U, V = compute_svd(image_features, indexes, device)
-		avg_train_loss, ce_loss, image_IB_loss, text_IB_loss, tn_loss = train_one_epoch(image_backbone, text_backbone, train_dataloader, 
+		avg_train_loss, ce_loss, image_IB_loss, text_IB_loss, tn_loss = train_one_epoch(image_backbone, text_backbone, text_subnet, train_dataloader, 
 																		 criterion, optimizer, scaler, device, rank, epoch, args.num_epochs, image_feature_centroids, image_feature_anti_centroids, text_feature_centroids, text_feature_anti_centroids, U, V, args)
 
 		print(f"Rank {rank} Epoch [{epoch+1}/{args.num_epochs}], Train Loss: {avg_train_loss}")
@@ -194,17 +215,17 @@ def main(rank, world_size, args):
 
 		# Checkpoint for the latest model
 		if rank == 0:
-			save_checkpoint(image_backbone_without_ddp, text_backbone_without_ddp, optimizer, scaler, epoch, best_loss, avg_test_loss, test_auc, args.checkpoint_dir, "latest")
+			save_checkpoint(image_backbone_without_ddp, text_backbone_without_ddp, text_subnet_without_ddp, subnet_optimizer, optimizer, scaler, epoch, best_loss, avg_test_loss, test_auc, args.checkpoint_dir, "latest")
 
 			# Save checkpoint for the best loss
 			if avg_test_loss < best_loss:
 				best_loss = avg_test_loss
-				save_checkpoint(image_backbone_without_ddp, text_backbone_without_ddp, optimizer, scaler, epoch, best_loss, avg_test_loss, test_auc, args.checkpoint_dir, "best_loss")
+				save_checkpoint(image_backbone_without_ddp, text_backbone_without_ddp, text_subnet_without_ddp, subnet_optimizer, optimizer, scaler, epoch, best_loss, avg_test_loss, test_auc, args.checkpoint_dir, "best_loss")
 
 			# Save checkpoint for the best AUC
 			if test_auc > best_auc:
 				best_auc = test_auc
-				save_checkpoint(image_backbone_without_ddp, text_backbone_without_ddp, optimizer, scaler, epoch, best_loss, avg_test_loss, best_auc, args.checkpoint_dir, "best_auc")
+				save_checkpoint(image_backbone_without_ddp, text_backbone_without_ddp, text_subnet_without_ddp, subnet_optimizer, optimizer, scaler, epoch, best_loss, avg_test_loss, best_auc, args.checkpoint_dir, "best_auc")
 	
 	cleanup_ddp()
 
@@ -213,29 +234,32 @@ if __name__ == "__main__":
 	# dataloader args
 	parser.add_argument('--train_file', type=str, required=True, help="Path to the train .pt file containing embeddings and labels")
 	parser.add_argument('--train_embedding_file', type=str, required=True, help="Path to the train .pt file containing embeddings and labels")
+	parser.add_argument('--train_logits_file', type=str, required=True, help="Path to the train .pt file containing text logits for subnet")
 	parser.add_argument('--test_file', type=str, required=True, help="Path to the test .pt file containing embeddings and labels")
-	parser.add_argument('--checkpoint_root_dir', type=str, default='./mfa2/checkpoints', help="Root directory to save checkpoints (with date/time appended)")
+	parser.add_argument('--checkpoint_root_dir', type=str, default='./mfa3/checkpoints', help="Root directory to save checkpoints (with date/time appended)")
 	parser.add_argument('--data_path', default=None, required=True, type=str, help='dataset root path')
-	parser.add_argument('--resume', default=False, action='store_true', help="Resume training from latest checkpoint if available")
+	parser.add_argument('--resume', default=None, type=str, help="Resume training from latest checkpoint if available")
 	# training args
 	parser.add_argument('--num_epochs', type=int, default=75, help="Number of epochs to train the model")
 	parser.add_argument('--input_size', type=int, default=224, help="input image size")
 	parser.add_argument('--warmup_epochs', type=int, default=5, help="Number of warmup epochs to train the model")
 	parser.add_argument('--batch_size', type=int, default=512, help="Batch size for training")
-	parser.add_argument('--lr', type=float, default=2.5e-4, help="Initial learning rate for training")
-	parser.add_argument('--text_lr', type=float, default=2.5e-5, help="Initial learning rate for training")
-	parser.add_argument('--min_lr', type=float, default=1e-5, help="Minimum learning rate for the CosineAnnealingLR scheduler")
-	parser.add_argument('--text_backbone_weight_decay', type=float, default=0.05, help="text backbone weight decay for Adam optimizer")
-	parser.add_argument('--weight_decay', type=float, default=0.05, help="Weight decay for Adam optimizer")
+	parser.add_argument('--lr', type=float, default=5e-6, help="Initial learning rate for training")
+	parser.add_argument('--text_lr', type=float, default=5e-6, help="Initial learning rate for training")
+	parser.add_argument('--text_subnet_lr', type=float, default=1e-4, help="Initial learning rate for training")
+	parser.add_argument('--min_lr', type=float, default=1e-6, help="Minimum learning rate for the CosineAnnealingLR scheduler")
+	parser.add_argument('--text_backbone_weight_decay', type=float, default=0, help="text backbone weight decay for Adam optimizer")
+	parser.add_argument('--weight_decay', type=float, default=0, help="Weight decay for Adam optimizer")
 	parser.add_argument('--num_classes', type=int, default=5, help="number of classes in the dataset")
 	parser.add_argument('--eval', type=bool, default=False, help="")
 	# text backbone args
 	parser.add_argument('--input_dim', type=int, default=4096, help="Embedding dimensions of the text embedder model")
 	parser.add_argument('--output_dim', type=int, default=768, help="Feature dimension; must be same as the image feature extraction backbon. Eg: 768 for ViT-B/16")
-	parser.add_argument('--finetune_adapter', required=True, type=str, help='path to pretrained adapter model')
+	parser.add_argument('--finetune_adapter', type=str, help='path to pretrained adapter model')
 	# image backbone args
 	parser.add_argument('--image_model', default='vit_base_patch16', type=str, help='Name of image backbone model to train')
-	parser.add_argument('--finetune', required=True, type=str, )
+	parser.add_argument('--finetune', type=str, )
+	parser.add_argument('--retrain', type=str, )
 	parser.add_argument('--drop_path', type=float, default=0.1, help='Drop path rate for vit (default: 0.1)')
 	parser.add_argument('--global_pool', action='store_true')
 	parser.add_argument('--layer_decay', type=float, default=0.55, help='Layer-wise lr decay from ELECTRA/BEiT')
@@ -246,7 +270,8 @@ if __name__ == "__main__":
 	parser.add_argument('--image_ib_weight', default=10, type=float)
 	parser.add_argument('--text_ib_weight', default=10, type=float)
 	parser.add_argument('--tn_loss_weight', default=0.00125, type=float)
-	parser.add_argument('--soft_rank', default=76, type=int)
+	parser.add_argument('--soft_rank', default=38, type=int)
+	parser.add_argument('--threshold', default=0.7, type=int)
 
 	args = parser.parse_args()
 
